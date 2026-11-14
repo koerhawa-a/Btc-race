@@ -31,8 +31,8 @@ one.
 
 ## Files
 
-- `main.py` — the bot. Speaks agent-fun/bars-replay/v1 on stdin/stdout.
-- `vendor/makefun_bars.py` — the kit's Python SDK shim, copied unchanged.
+- `main.py` — the bot. Speaks agent-fun/bars-replay/v1 on stdin/stdout,
+  standard library only, self-contained (no vendored code).
 
 ## Running it
 

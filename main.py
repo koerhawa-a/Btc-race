@@ -10,15 +10,13 @@
 # the neighbouring parameter sets (fast 45-50, slow 120, trail 20-25 bps,
 # take-profit 60-80 bps, fifth to quarter size) all end the dev window
 # slightly positive, so this is a robust region, not a tuned point.
-# Speaks agent-fun/bars-replay/v1 through the vendored SDK shim: the harness
-# sends hello, then one batch (a bar) at a time, and the bot answers each batch
-# with its orders. Deterministic: no clock, no randomness, no network, no
-# files outside the repository; the same bars give the same orders.
-import os
+# Speaks agent-fun/bars-replay/v1 on stdin/stdout with the standard library
+# alone: the harness sends hello, then one batch (a bar) at a time, and the
+# bot answers each batch with its orders. Deterministic: no clock, no
+# randomness, no network, no environment, no files outside the repository;
+# the same bars give the same orders.
+import json
 import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
-import makefun_bars
 
 SYMBOL = "CBBTC"
 FAST = 45
@@ -53,11 +51,13 @@ slow = Ema(SLOW)
 prev_gap = None  # fast - slow after the previous bar
 entry = None  # entry price in bar units (x1e5), from the position's cost
 peak = None  # highest close since entry
+next_id = 1  # client_ids o1, o2, ... never reused
 
 
-def on_batch(state, batch):
-    global prev_gap, entry, peak
-    bar = state.latest.get(SYMBOL)
+def decide(cash, positions, latest, warming_up):
+    """The orders for this batch (a bar). Returns a list of order dicts."""
+    global prev_gap, entry, peak, next_id
+    bar = latest.get(SYMBOL)
     if bar is None:
         return []
     close = int(bar["c"])
@@ -66,26 +66,28 @@ def on_batch(state, batch):
     if fast.value is None or slow.value is None:
         return []
     gap = fast.value - slow.value
-    if state.warming_up:
+    if warming_up:
         prev_gap = gap
         return []
-    holding = SYMBOL in state.positions
+    holding = SYMBOL in positions
     if not holding:
         entry = None
         peak = None
         if prev_gap is not None and prev_gap <= 0 and gap > 0:
             prev_gap = gap
-            amount = state.cash * SIZE_NUM // SIZE_DEN
+            amount = cash * SIZE_NUM // SIZE_DEN
             if amount >= MIN_NOTIONAL:
-                return [{"side": "buy", "symbol": SYMBOL,
+                cid = "o%d" % next_id
+                next_id += 1
+                return [{"side": "buy", "client_id": cid, "symbol": SYMBOL,
                          "notional_quote_units": amount,
                          "max_slippage_bps": MAX_SLIP_BPS}]
         prev_gap = gap
         return []
-    pos = state.positions[SYMBOL]
+    qty, cost = positions[SYMBOL]
     if entry is None:
         # cost (quote units) / qty -> price in bar units: cost * 1e7 // qty
-        entry = pos.cost * 10 ** 7 // pos.qty
+        entry = cost * 10 ** 7 // qty
         peak = close
     peak = max(peak, close)
     sell = False
@@ -99,9 +101,45 @@ def on_batch(state, batch):
     if sell:
         entry = None
         peak = None
-        return [{"side": "sell", "symbol": SYMBOL, "qty": pos.qty,
-                 "max_slippage_bps": MAX_SLIP_BPS}]
+        cid = "o%d" % next_id
+        next_id += 1
+        return [{"side": "sell", "client_id": cid, "symbol": SYMBOL,
+                 "qty": qty, "max_slippage_bps": MAX_SLIP_BPS}]
     return []
 
 
-makefun_bars.run(on_batch)
+def main():
+    cash = 0
+    positions = {}
+    latest = {}
+    warmup_bars = 0
+    seq = -1
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        msg = json.loads(line)
+        kind = msg.get("type")
+        if kind == "hello":
+            warmup_bars = msg.get("warmup_bars", 0)
+            cash = int(msg["capital"]["quote_units"])
+            continue
+        if kind == "batch":
+            seq = msg["seq"]
+            for bar in msg["bars"]:
+                latest[bar["symbol"]] = bar
+            account = msg["account"]
+            cash = int(account["cash_quote_units"])
+            positions = {p["symbol"]: (int(p["qty"]), int(p["cost_quote_units"]))
+                         for p in account["positions"]}
+            warming_up = warmup_bars > 0 and seq < warmup_bars
+            orders = decide(cash, positions, latest, warming_up)
+            reply = json.dumps({"type": "reply", "seq": seq, "orders": orders},
+                               separators=(",", ":"))
+            sys.stdout.write(reply + "\n")
+            sys.stdout.flush()
+        elif kind == "done":
+            return
+
+
+main()
